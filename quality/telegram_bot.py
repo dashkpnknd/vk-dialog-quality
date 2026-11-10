@@ -151,12 +151,15 @@ class ReportBot:
             with connect(self.db_path) as db:
                 result = sync_all(db)
                 errors = [item for item in result if "error" in item]
+                incomplete = sum(item.get("incomplete", 0) for item in result)
                 if not result:
                     text = "Сообщества пока не добавлены."
                 else:
                     text = "Сбор завершён: {} сообществ, {} ошибок.".format(len(result), len(errors))
                     if errors:
                         text += "\n" + "\n".join("{}: {}".format(item["project"], item["error"]) for item in errors[:5])
+                    if incomplete:
+                        text += "\nИстория {} диалогов превысила предел чтения; они не учтены и требуют отдельной проверки.".format(incomplete)
                     if (not errors and os.environ.get("GOOGLE_SPREADSHEET_ID") and
                             os.path.isfile(os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", ""))):
                         try:

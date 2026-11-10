@@ -11,15 +11,24 @@ def sync_group(db: sqlite3.Connection, group: sqlite3.Row, since: int,
                client: VKClient = None) -> Dict[str, int]:
     config = get_settings(db)
     client = client or VKClient(group["token"], group["group_id"])
-    counts = {"scanned": 0, "new": 0, "old": 0, "review": 0}
+    counts = {"scanned": 0, "new": 0, "old": 0, "review": 0, "incomplete": 0}
     now = int(time.time())
     for conversation in client.conversations_since(since):
         peer_id = int(conversation["conversation"]["peer"]["id"])
         counts["scanned"] += 1
-        history, has_older, truncated = client.history_since(peer_id, since)
+        anchor_row = db.execute("""SELECT episode_key, first_at, label_id, label_source
+            FROM observations WHERE group_id=? AND peer_id=? AND status!='qualified'
+            AND first_at < ? ORDER BY first_at LIMIT 1""",
+            (group["group_id"], peer_id, since)).fetchone()
+        anchor = dict(anchor_row) if anchor_row else None
+        cutoff = min(since, anchor["first_at"]) if anchor else since
+        history, has_older, truncated = client.history_since(peer_id, cutoff)
+        if truncated:
+            counts["incomplete"] += 1
+            continue
         if not history:
             continue
-        items = episodes(peer_id, history, config, since, has_older, truncated)
+        items = episodes(peer_id, history, config, cutoff, has_older, truncated, anchor)
         if not items:
             counts["old"] += 1
             continue

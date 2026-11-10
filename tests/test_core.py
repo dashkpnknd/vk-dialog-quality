@@ -87,6 +87,27 @@ class EpisodeTests(unittest.TestCase):
                 sync_group(db, group, self.base, client)
                 self.assertEqual(db.execute("SELECT status FROM observations").fetchone()[0], "qualified")
 
+    def test_very_late_reply_updates_old_campaign_without_new_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with connect(str(Path(directory) / "quality.sqlite3")) as db:
+                db.execute("INSERT INTO groups(group_id, project, token) VALUES (1, 'Магазин', 'secret')")
+                group = db.execute("SELECT * FROM groups WHERE group_id=1").fetchone()
+                initial = {"id": 1, "date": self.base, "out": 0, "text": "Начать",
+                           "payload": "{}", "ref": "111111111"}
+                item = episodes(123, [initial], DEFAULT_SETTINGS, self.base)[0]
+                save_observation(db, 1, item, self.base)
+                class FakeVK:
+                    def conversations_since(self, since):
+                        return iter([{"conversation": {"peer": {"id": 123}}}])
+                    def history_since(self, peer_id, since):
+                        return [initial, {"id": 2, "date": self.base + 45 * 86400,
+                                          "out": 0, "text": "Есть в наличии?"}], False, False
+                client = FakeVK()
+                client.base = self.base
+                sync_group(db, group, self.base + 30 * 86400, client)
+                record = db.execute("SELECT status, first_at FROM observations").fetchone()
+                self.assertEqual(tuple(record), ("qualified", self.base))
+
 
 if __name__ == "__main__":
     unittest.main()
