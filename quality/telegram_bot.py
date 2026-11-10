@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from .db import connect, settings as get_settings
-from .report import report_data, publish_google
+from .report import csv_text, report_data, publish_google
 from .sync import sync_all
 
 
@@ -49,6 +49,18 @@ class TelegramAPI:
 
     def delete(self, chat_id: int, message_id: int) -> None:
         self.call("deleteMessage", chat_id=chat_id, message_id=message_id)
+
+    def send_document(self, chat_id: int, filename: str, content: str, caption: str) -> None:
+        try:
+            response = requests.post(self.base + "sendDocument",
+                                     data={"chat_id": chat_id, "caption": caption},
+                                     files={"document": (filename, ("\ufeff" + content).encode("utf-8"), "text/csv")},
+                                     timeout=45)
+            response.raise_for_status()
+            if not response.json().get("ok"):
+                raise TelegramError("Telegram rejected the report file")
+        except (requests.RequestException, ValueError):
+            raise TelegramError("Could not send the report file") from None
 
 
 def _get_setting(db: sqlite3.Connection, key: str, default: Any = None) -> Any:
@@ -101,11 +113,9 @@ def group_summary(db: sqlite3.Connection, group_id: int) -> str:
     if not group_rows:
         return "{}: за 30 дней данных пока нет.".format(group["project"])
     lines = ["{} · ID {} · 30 дней".format(group["project"], group_id)]
-    for row in group_rows[:40]:
+    for row in group_rows:
         lines.append("{}: {} из {} ({}%) · проверка {}".format(
             row["label_id"], row["qualified"], row["total"], row["percent"], row["review"]))
-    if len(group_rows) > 40:
-        lines.append("Остальные ID — в Google-таблице.")
     return "\n".join(lines)
 
 
@@ -116,6 +126,16 @@ class ReportBot:
         self.sync_lock = threading.Lock()
         self.status = "Сбор ещё не запускался в этой сессии."
         self.pending: Dict[int, str] = {}
+
+    def _send_long(self, chat_id: int, text: str) -> None:
+        part = ""
+        for line in text.splitlines():
+            if len(part) + len(line) + 1 > 3500 and part:
+                self.api.send(chat_id, part)
+                part = ""
+            part += line + "\n"
+        if part:
+            self.api.send(chat_id, part)
 
     def _send_subscribers(self, text: str) -> None:
         with connect(self.db_path) as db:
@@ -173,6 +193,10 @@ class ReportBot:
         if not isinstance(chat_id, int) or chat.get("type") != "private":
             return
         text = str(message.get("text") or "").strip()
+        buttons = {"📊 Отчёт": "/report", "🔄 Обновить": "/sync", "🏪 Проекты": "/groups",
+                   "➕ Проект": "/newproject", "➕ Группа": "/newgroup", "📄 Таблица": "/sheet",
+                   "ℹ️ Помощь": "/help"}
+        text = buttons.get(text, text)
         if self.pending.get(chat_id) and not text.startswith("/"):
             action = self.pending.pop(chat_id)
             if action == "project":
@@ -205,10 +229,6 @@ class ReportBot:
                     db.commit()
                 self.api.send(chat_id, "Группа {} подключена к проекту «{}». Запустите «🔄 Обновить».".format(group_id, project), keyboard=True)
                 return
-        buttons = {"📊 Отчёт": "/report", "🔄 Обновить": "/sync", "🏪 Проекты": "/groups",
-                   "➕ Проект": "/newproject", "➕ Группа": "/newgroup", "📄 Таблица": "/sheet",
-                   "ℹ️ Помощь": "/help"}
-        text = buttons.get(text, text)
         if not text.startswith("/"):
             return
         command, _, argument = text.partition(" ")
@@ -233,9 +253,17 @@ class ReportBot:
         elif command == "/report":
             with connect(self.db_path) as db:
                 self.api.send(chat_id, summary(db, 30))
+                detail, _ = report_data(db, 30)
+                if detail:
+                    self.api.send_document(chat_id, "vk-quality-30-days.csv", csv_text(detail),
+                                           "Полная статистика по каждому проекту и ID рекламы")
         elif command == "/today":
             with connect(self.db_path) as db:
                 self.api.send(chat_id, summary(db, 1))
+                detail, _ = report_data(db, 1)
+                if detail:
+                    self.api.send_document(chat_id, "vk-quality-today.csv", csv_text(detail),
+                                           "Полная статистика за сегодня")
         elif command == "/group":
             try:
                 group_id = int(argument.strip())
@@ -243,7 +271,7 @@ class ReportBot:
                 self.api.send(chat_id, "Укажите числовой ID: /group 123456")
                 return
             with connect(self.db_path) as db:
-                self.api.send(chat_id, group_summary(db, group_id))
+                self._send_long(chat_id, group_summary(db, group_id))
         elif command == "/groups":
             with connect(self.db_path) as db:
                 projects = [row["name"] for row in db.execute("SELECT name FROM projects ORDER BY name")]

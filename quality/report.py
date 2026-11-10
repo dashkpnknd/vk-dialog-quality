@@ -37,7 +37,9 @@ def csv_text(items: List[Dict[str, Any]], daily: bool = False) -> str:
     writer = csv.writer(buffer)
     writer.writerow(DAILY_HEADERS if daily else HEADERS)
     for item in items:
-        writer.writerow(([item["day"]] if daily else []) + [item[field] for field in FIELDS])
+        values = ([item["day"]] if daily else []) + [item[field] for field in FIELDS]
+        writer.writerow(["'" + value if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")) else value
+                         for value in values])
     return buffer.getvalue()
 
 

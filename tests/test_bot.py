@@ -16,6 +16,9 @@ class FakeTelegram:
     def send(self, chat_id, text, keyboard=False):
         self.messages.append((chat_id, text))
 
+    def send_document(self, chat_id, filename, content, caption):
+        self.messages.append((chat_id, caption + "\n" + content))
+
 
 class BotTests(unittest.TestCase):
     def test_private_admin_report_and_group_detail(self):
@@ -33,9 +36,9 @@ class BotTests(unittest.TestCase):
             api = FakeTelegram()
             bot = ReportBot(db_path, api)
             bot.handle({"message": {"chat": {"id": 999, "type": "private"}, "text": "/report"}})
-            self.assertIn("квалов: 1", api.messages[-1][1])
+            self.assertIn("квалов: 1", api.messages[-2][1])
             bot.handle({"message": {"chat": {"id": 123, "type": "private"}, "text": "/report"}})
-            self.assertIn("квалов: 1", api.messages[-1][1])
+            self.assertIn("232577648", api.messages[-1][1])
             bot.handle({"message": {"chat": {"id": 123, "type": "private"}, "text": "/group 42"}})
             self.assertIn("232577648", api.messages[-1][1])
 
