@@ -1,0 +1,8 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - ./secrets:/run/secrets:ro
+    restart: unless-stopped
