@@ -280,7 +280,7 @@ class ReportBot:
                 projects = [row["name"] for row in db.execute("SELECT name FROM projects ORDER BY name")]
                 groups = list(db.execute("SELECT project, group_id, enabled FROM groups ORDER BY project, group_id"))
             lines = ["{}: {}".format(name, ", ".join(str(g["group_id"]) + (" (отключено)" if not g["enabled"] else "") for g in groups if g["project"] == name) or "группы пока нет") for name in projects]
-            self.api.send(chat_id, "\n".join(lines) if lines else "Проектов пока нет. Нажмите «➕ Проект».")
+            self._send_long(chat_id, "\n".join(lines) if lines else "Проектов пока нет. Нажмите «➕ Проект».")
         elif command == "/sheet":
             spreadsheet_id = os.environ.get("GOOGLE_SPREADSHEET_ID")
             self.api.send(chat_id, "https://docs.google.com/spreadsheets/d/" + spreadsheet_id if spreadsheet_id else "Google-таблица ещё не подключена.")
