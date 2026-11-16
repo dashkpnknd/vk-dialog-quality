@@ -46,6 +46,12 @@ CREATE TABLE IF NOT EXISTS city_topics (
     thread_id INTEGER NOT NULL,
     PRIMARY KEY (chat_id, city)
 );
+CREATE TABLE IF NOT EXISTS project_topics (
+    chat_id INTEGER NOT NULL,
+    project TEXT NOT NULL,
+    thread_id INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, project)
+);
 """
 
 

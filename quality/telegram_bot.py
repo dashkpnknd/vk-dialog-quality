@@ -14,7 +14,7 @@ import requests
 from .db import connect, settings as get_settings
 from .report import csv_text, report_data, publish_google
 from .sync import sync_all
-from .topics import publish_city_reports
+from .topics import publish_project_reports
 
 
 class TelegramError(RuntimeError):
@@ -56,6 +56,9 @@ class TelegramAPI:
     def create_topic(self, chat_id: int, name: str) -> int:
         topic = self.call("createForumTopic", chat_id=chat_id, name=name[:128])
         return int(topic["message_thread_id"])
+
+    def edit_topic(self, chat_id: int, thread_id: int, name: str) -> None:
+        self.call("editForumTopic", chat_id=chat_id, message_thread_id=thread_id, name=name[:128])
 
     def delete(self, chat_id: int, message_id: int) -> None:
         self.call("deleteMessage", chat_id=chat_id, message_id=message_id)
@@ -179,7 +182,7 @@ class ReportBot:
                             text += "\nОшибка записи в Google-таблицу: " + str(exc)
                     if not errors:
                         try:
-                            posted = publish_city_reports(db, self.api)
+                            posted = publish_project_reports(db, self.api)
                             if posted["reports"]:
                                 text += "\nОтчёты отправлены в темы городов: {}.".format(posted["reports"])
                         except Exception as exc:
@@ -230,21 +233,26 @@ class ReportBot:
                     self.api.send(chat_id, "Дайте боту права администратора «Управлять темами» и повторите /connect.")
                     return
                 with connect(self.db_path) as db:
+                    already_connected = bool(db.execute(
+                        "SELECT 1 FROM report_chats WHERE chat_id=?", (chat_id,)).fetchone())
                     db.execute("INSERT INTO report_chats(chat_id,title,connected_at) VALUES (?,?,?) "
                                "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title",
                                (chat_id, str(info.get("title") or chat.get("title") or "Отчёты"), int(time.time())))
                     db.commit()
-                    posted = publish_city_reports(db, self.api, chat_id)
-                self.api.send(chat_id, "Чат подключён. Создано тем: {}. Отправлено отчётов: {}. \
-Новые отчёты будут приходить после ежедневного сбора; /report отправит текущие данные.".format(
-                    posted["topics"], posted["reports"]))
+                    posted = publish_project_reports(db, self.api, chat_id) if not already_connected else None
+                if posted:
+                    self.api.send(chat_id, "Чат подключён. Создано тем: {}. Отправлено отчётов: {}. "
+                                  "Новые отчёты будут приходить после ежедневного сбора; /report отправит текущие данные.".format(
+                                      posted["topics"], posted["reports"]))
+                else:
+                    self.api.send(chat_id, "Чат уже подключён. Чтобы получить текущий отчёт, отправьте /report.")
             elif command == "/report":
                 with connect(self.db_path) as db:
                     if not db.execute("SELECT 1 FROM report_chats WHERE chat_id=?", (chat_id,)).fetchone():
                         self.api.send(chat_id, "Сначала отправьте /connect в этом чате.")
                         return
-                    posted = publish_city_reports(db, self.api, chat_id)
-                self.api.send(chat_id, "Отчёты по городам отправлены: {}.".format(posted["reports"]))
+                    posted = publish_project_reports(db, self.api, chat_id)
+                self.api.send(chat_id, "Отчёты по магазинам отправлены: {}.".format(posted["reports"]))
             return
         if chat.get("type") != "private":
             return
