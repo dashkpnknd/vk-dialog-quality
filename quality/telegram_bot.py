@@ -1,4 +1,4 @@
-"""Small administrator-only Telegram interface for the VK report."""
+"""Telegram interface for VK quality reports and city forum topics."""
 
 from datetime import datetime
 import json
@@ -14,6 +14,7 @@ import requests
 from .db import connect, settings as get_settings
 from .report import csv_text, report_data, publish_google
 from .sync import sync_all
+from .topics import publish_city_reports
 
 
 class TelegramError(RuntimeError):
@@ -38,14 +39,23 @@ class TelegramAPI:
             raise TelegramError("Telegram API error: " + str(payload.get("description", "unknown")))
         return payload.get("result")
 
-    def send(self, chat_id: int, text: str, keyboard: bool = False) -> None:
+    def send(self, chat_id: int, text: str, keyboard: bool = False,
+             thread_id: Optional[int] = None, parse_mode: Optional[str] = None) -> None:
         params = {"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True}
+        if thread_id is not None:
+            params["message_thread_id"] = thread_id
+        if parse_mode:
+            params["parse_mode"] = parse_mode
         if keyboard:
             params["reply_markup"] = {"keyboard": [
                 [{"text": "📊 Отчёт"}, {"text": "🔄 Обновить"}],
                 [{"text": "🏪 Проекты"}, {"text": "➕ Проект"}, {"text": "➕ Группа"}],
                 [{"text": "📄 Таблица"}, {"text": "ℹ️ Помощь"}]], "resize_keyboard": True}
         self.call("sendMessage", **params)
+
+    def create_topic(self, chat_id: int, name: str) -> int:
+        topic = self.call("createForumTopic", chat_id=chat_id, name=name[:128])
+        return int(topic["message_thread_id"])
 
     def delete(self, chat_id: int, message_id: int) -> None:
         self.call("deleteMessage", chat_id=chat_id, message_id=message_id)
@@ -167,6 +177,13 @@ class ReportBot:
                             text += "\nGoogle-таблица обновлена."
                         except Exception as exc:
                             text += "\nОшибка записи в Google-таблицу: " + str(exc)
+                    if not errors:
+                        try:
+                            posted = publish_city_reports(db, self.api)
+                            if posted["reports"]:
+                                text += "\nОтчёты отправлены в темы городов: {}.".format(posted["reports"])
+                        except Exception as exc:
+                            text += "\nОшибка отправки в темы городов: " + str(exc)
                     text += "\n\n" + summary(db, 30)
             self.status = text.split("\n", 1)[0]
             if reply_to is None:
@@ -193,9 +210,44 @@ class ReportBot:
         message = update.get("message") or {}
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
-        if not isinstance(chat_id, int) or chat.get("type") != "private":
+        if not isinstance(chat_id, int):
             return
         text = str(message.get("text") or "").strip()
+        if chat.get("type") in ("group", "supergroup"):
+            command_token = text.partition(" ")[0]
+            command, _, mentioned_bot = command_token.partition("@")
+            if mentioned_bot and mentioned_bot.casefold() != "vk_dialog_quality_report_bot":
+                return
+            command = command.lower()
+            if command == "/connect":
+                info = self.api.call("getChat", chat_id=chat_id)
+                if not info.get("is_forum"):
+                    self.api.send(chat_id, "Включите темы в настройках группы, затем повторите /connect.")
+                    return
+                me = self.api.call("getMe")
+                member = self.api.call("getChatMember", chat_id=chat_id, user_id=me["id"])
+                if member.get("status") not in ("administrator", "creator") or not member.get("can_manage_topics"):
+                    self.api.send(chat_id, "Дайте боту права администратора «Управлять темами» и повторите /connect.")
+                    return
+                with connect(self.db_path) as db:
+                    db.execute("INSERT INTO report_chats(chat_id,title,connected_at) VALUES (?,?,?) "
+                               "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title",
+                               (chat_id, str(info.get("title") or chat.get("title") or "Отчёты"), int(time.time())))
+                    db.commit()
+                    posted = publish_city_reports(db, self.api, chat_id)
+                self.api.send(chat_id, "Чат подключён. Создано тем: {}. Отправлено отчётов: {}. \
+Новые отчёты будут приходить после ежедневного сбора; /report отправит текущие данные.".format(
+                    posted["topics"], posted["reports"]))
+            elif command == "/report":
+                with connect(self.db_path) as db:
+                    if not db.execute("SELECT 1 FROM report_chats WHERE chat_id=?", (chat_id,)).fetchone():
+                        self.api.send(chat_id, "Сначала отправьте /connect в этом чате.")
+                        return
+                    posted = publish_city_reports(db, self.api, chat_id)
+                self.api.send(chat_id, "Отчёты по городам отправлены: {}.".format(posted["reports"]))
+            return
+        if chat.get("type") != "private":
+            return
         buttons = {"📊 Отчёт": "/report", "🔄 Обновить": "/sync", "🏪 Проекты": "/groups",
                    "➕ Проект": "/newproject", "➕ Группа": "/newgroup", "📄 Таблица": "/sheet",
                    "ℹ️ Помощь": "/help"}
@@ -203,12 +255,15 @@ class ReportBot:
         if self.pending.get(chat_id) and not text.startswith("/"):
             action = self.pending.pop(chat_id)
             if action == "project":
-                name = text[:120].strip()
+                name, _, city = text.partition(";")
+                name, city = name[:120].strip(), city[:120].strip()
                 if not name:
                     self.api.send(chat_id, "Название проекта пустое. Нажмите «➕ Проект» и попробуйте ещё раз.")
                     return
                 with connect(self.db_path) as db:
-                    db.execute("INSERT OR IGNORE INTO projects(name) VALUES (?)", (name,))
+                    db.execute("INSERT INTO projects(name,city) VALUES (?,?) "
+                               "ON CONFLICT(name) DO UPDATE SET city=COALESCE(excluded.city,projects.city)",
+                               (name, city or None))
                     db.commit()
                 self.api.send(chat_id, "Проект «{}» добавлен. Теперь подключите группу кнопкой «➕ Группа».".format(name), keyboard=True)
                 return
@@ -241,7 +296,7 @@ class ReportBot:
                 with connect(self.db_path) as db:
                     db.execute("INSERT OR IGNORE INTO subscribers(chat_id, subscribed_at) VALUES (?, ?)", (chat_id, int(time.time())))
                     db.commit()
-            self.api.send(chat_id, "Кнопки: отчёт, обновление, проекты, добавление проекта и группы, таблица.\nКоманды: /report, /today, /group ID, /groups, /sheet, /sync, /status.\nПри добавлении группы бот попросит название проекта, числовой ID сообщества и токен VK. Сообщение с токеном будет удалено.", keyboard=True)
+            self.api.send(chat_id, "Кнопки: отчёт, обновление, проекты, добавление проекта и группы, таблица.\nКоманды: /report, /today, /group ID, /groups, /city, /sheet, /sync, /status.\nВ чате с темами отправьте /connect: бот создаст темы городов. При добавлении группы сообщение с токеном будет удалено.", keyboard=True)
         elif command == "/stop":
             with connect(self.db_path) as db:
                 db.execute("DELETE FROM subscribers WHERE chat_id=?", (chat_id,))
@@ -249,7 +304,17 @@ class ReportBot:
             self.api.send(chat_id, "Ежедневные сообщения отключены. Команды бота остаются доступны. Для подписки отправьте /start.")
         elif command == "/newproject":
             self.pending[chat_id] = "project"
-            self.api.send(chat_id, "Напишите название нового проекта одним сообщением.")
+            self.api.send(chat_id, "Напишите: название проекта ; город. Пример: Магазин А ; Калуга")
+        elif command == "/city":
+            name, separator, city = argument.rpartition(";")
+            if not separator or not name.strip() or not city.strip():
+                self.api.send(chat_id, "Формат: /city Название проекта ; Город")
+                return
+            with connect(self.db_path) as db:
+                changed = db.execute("UPDATE projects SET city=? WHERE name=?",
+                                     (city.strip()[:120], name.strip())).rowcount
+                db.commit()
+            self.api.send(chat_id, "Город проекта обновлён." if changed else "Проект не найден. Проверьте название через /groups.")
         elif command == "/newgroup":
             self.pending[chat_id] = "group"
             self.api.send(chat_id, "Отправьте одним сообщением: название проекта | числовой ID группы VK | токен группы.\nПример: Магазин А | 123456789 | токен\nСообщение с токеном бот удалит после получения.")

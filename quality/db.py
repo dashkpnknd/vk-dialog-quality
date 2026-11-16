@@ -35,6 +35,17 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY, subscribed_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS report_chats (
+    chat_id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    connected_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS city_topics (
+    chat_id INTEGER NOT NULL,
+    city TEXT NOT NULL,
+    thread_id INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, city)
+);
 """
 
 
@@ -45,6 +56,8 @@ def connect(path: str) -> sqlite3.Connection:
     os.chmod(path, 0o600)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    if "city" not in {row["name"] for row in db.execute("PRAGMA table_info(projects)")}:
+        db.execute("ALTER TABLE projects ADD COLUMN city TEXT")
     db.execute("INSERT OR IGNORE INTO projects(name) SELECT DISTINCT project FROM groups")
     for key, value in DEFAULT_SETTINGS.items():
         db.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, json.dumps(value)))
