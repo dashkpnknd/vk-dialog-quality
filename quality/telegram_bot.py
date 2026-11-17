@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from .db import connect, settings as get_settings
-from .report import csv_text, report_data, publish_google
+from .report import campaign_rows, csv_text, report_data, publish_google
 from .jobs import enqueue_groups
 from .topics import format_project_report, publish_project_reports, report_date_range
 from .vk import VKClient, VKError, group_from_token
@@ -60,7 +60,7 @@ class TelegramAPI:
             params["parse_mode"] = parse_mode
         if keyboard:
             params["reply_markup"] = {"keyboard": [
-                [{"text": "📊 Отчёт"}],
+                [{"text": "📊 Отчёт"}, {"text": "🎯 Кампании"}],
                 [{"text": "🏪 Проекты"}, {"text": "➕ Подключить VK"}],
                 [{"text": "📄 Таблица"}]], "resize_keyboard": True}
         if reply_markup:
@@ -71,6 +71,11 @@ class TelegramAPI:
              reply_markup: Dict[str, Any]) -> None:
         self.call("editMessageText", chat_id=chat_id, message_id=message_id,
                   text=text, parse_mode="HTML", reply_markup=reply_markup)
+
+    def edit_markup(self, chat_id: int, message_id: int,
+                    reply_markup: Dict[str, Any]) -> None:
+        self.call("editMessageReplyMarkup", chat_id=chat_id, message_id=message_id,
+                  reply_markup=reply_markup)
 
     def answer_callback(self, callback_id: str, text: Optional[str] = None) -> None:
         params = {"callback_query_id": callback_id}
@@ -203,7 +208,44 @@ class ReportBot:
         return {"inline_keyboard": [
             [{"text": "📊 Отчёт", "callback_data": "g:report"},
              {"text": "🏪 Проекты", "callback_data": "g:projects"}],
-            [{"text": "📄 Таблица", "callback_data": "g:sheet"}]]}
+            [{"text": "🎯 Кампании", "callback_data": "g:campaign"},
+             {"text": "📄 Таблица", "callback_data": "g:sheet"}]]}
+
+    def _campaign_report(self, db: sqlite3.Connection, label_id: str) -> str:
+        if not label_id.isascii() or not label_id.isdecimal() or len(label_id) > 32:
+            return "Отправьте числовой рекламный ID, например 248543102."
+        matches = campaign_rows(db, label_id)
+        if not matches:
+            return ("По ID <code>{}</code> за последние 30 дней обращений пока нет. "
+                    "Новый ID появится после первого собранного обращения с этой меткой.").format(label_id)
+        lines = ["🎯 <b>Рекламный ID {}</b>".format(label_id),
+                 "Последние 30 дней: {}".format(report_date_range(db)),
+                 "━━━━━━━━━━━━━━━━━━━━"]
+        for row in matches:
+            percent = ("{:.1f}".format(100 * row["qualified"] / row["total"])).replace(".", ",")
+            lines.extend(("", "🏪 <b>{}</b>".format(escape(row["project"])),
+                          "Обращения: <b>{}</b>".format(row["total"]),
+                          "Квалы: <b>{}</b> ({}%) · не квалы: <b>{}</b>".format(
+                              row["qualified"], percent, row["not_qualified"])))
+            if row["review"]:
+                lines.append("На проверке: <b>{}</b>".format(row["review"]))
+        return "\n".join(lines)
+
+    def _send_campaign_report(self, chat_id: int, label_id: str) -> None:
+        with connect(self.db_path) as db:
+            report = self._campaign_report(db, label_id.strip())
+        part = ""
+        for line in report.splitlines():
+            if len(part) + len(line) + 1 > 3500 and part:
+                self.api.send(chat_id, part.rstrip(), parse_mode="HTML")
+                part = ""
+            part += line + "\n"
+        if part:
+            self.api.send(chat_id, part.rstrip(), parse_mode="HTML")
+
+    def _ask_campaign_id(self, chat_id: int) -> None:
+        self.api.send(chat_id, "Отправьте числовой рекламный ID. Покажу результаты по всем магазинам, где он встретился.",
+                      reply_markup={"force_reply": True, "selective": True})
 
     def ensure_general_panel(self, db: sqlite3.Connection, chat_id: int) -> bool:
         """Create one persistent General-topic control message per connected chat."""
@@ -220,6 +262,11 @@ class ReportBot:
             db.commit()
         else:
             message_id = panel["message_id"]
+            try:
+                self.api.edit_markup(chat_id, message_id, self._general_markup())
+            except TelegramError as exc:
+                if "message is not modified" not in str(exc).lower():
+                    raise
             if panel["pinned"]:
                 return True
         try:
@@ -326,6 +373,8 @@ class ReportBot:
                 with connect(self.db_path) as db:
                     text, markup = self._report_menu(db)
                 self.api.send(chat_id, text, parse_mode="HTML", reply_markup=markup)
+            elif data == "g:campaign":
+                self._ask_campaign_id(chat_id)
             elif data == "g:sheet":
                 spreadsheet_id = os.environ.get("GOOGLE_SPREADSHEET_ID")
                 self.api.send(chat_id, "https://docs.google.com/spreadsheets/d/" + spreadsheet_id
@@ -385,12 +434,18 @@ class ReportBot:
                     pass
                 self.api.send(chat_id, "Команду доступа отправьте боту в личном чате.")
                 return
-            if command not in ("/connect", "/report"):
+            campaign_reply = str((message.get("reply_to_message") or {}).get("text") or "").startswith(
+                "Отправьте числовой рекламный ID.")
+            if command not in ("/connect", "/report", "/campaign") and not campaign_reply:
                 return
             user_id = (message.get("from") or {}).get("id")
             with connect(self.db_path) as db:
                 if not self._authorized(db, user_id):
                     self.api.send(chat_id, "Сначала откройте бота в личном чате и введите команду доступа.")
+                    return
+                if (command == "/campaign" or campaign_reply) and not db.execute(
+                        "SELECT 1 FROM report_chats WHERE chat_id=?", (chat_id,)).fetchone():
+                    self.api.send(chat_id, "Сначала отправьте /connect в этом чате.")
                     return
             if command == "/connect":
                 info = self.api.call("getChat", chat_id=chat_id)
@@ -427,6 +482,15 @@ class ReportBot:
                 started = self.start_sync(chat_id)
                 self.api.send(chat_id, "Обновление VK поставлено в очередь. Готовые отчёты появятся в темах."
                               if started else "Подключённых сообществ пока нет.")
+            elif command == "/campaign" or campaign_reply:
+                if command == "/campaign":
+                    _, _, label_id = text.partition(" ")
+                else:
+                    label_id = text
+                if label_id.strip():
+                    self._send_campaign_report(chat_id, label_id)
+                else:
+                    self._ask_campaign_id(chat_id)
             return
         if chat.get("type") != "private":
             return
@@ -450,7 +514,8 @@ class ReportBot:
             if not self._authorized(db, user_id):
                 self.api.send(chat_id, "Для доступа введите полученную от команды команду в личном чате бота.")
                 return
-        buttons = {"📊 Отчёт": "/report", "🔄 Обновить": "/report",
+        buttons = {"📊 Отчёт": "/report", "🎯 Кампании": "/campaign",
+                   "🔄 Обновить": "/report",
                    "🔄 Собрать данные": "/report", "🏪 Проекты": "/groups",
                    "➕ Подключить VK": "/newgroup", "➕ Проект": "/newgroup",
                    "➕ Группа": "/newgroup", "📄 Таблица": "/sheet",
@@ -458,6 +523,9 @@ class ReportBot:
         text = buttons.get(text, text)
         if self.pending.get(chat_id) and not text.startswith("/"):
             action = self.pending.pop(chat_id)
+            if action == "campaign":
+                self._send_campaign_report(chat_id, text)
+                return
             if action == "project":
                 name, _, city = text.partition(";")
                 name, city = name[:120].strip(), city[:120].strip()
@@ -530,6 +598,12 @@ class ReportBot:
         elif command == "/newgroup":
             self.pending[chat_id] = "group"
             self.api.send(chat_id, "Отправьте одним сообщением ключ доступа сообщества VK. Название и ID бот определит сам. Сообщение с ключом будет удалено после получения.")
+        elif command == "/campaign":
+            if argument.strip():
+                self._send_campaign_report(chat_id, argument)
+            else:
+                self.pending[chat_id] = "campaign"
+                self._ask_campaign_id(chat_id)
         elif command in ("/report", "/sync"):
             self.api.send(chat_id, "Обновление VK поставлено в очередь. Ниже последняя доступная сводка; новые данные появятся в темах."
                           if self.start_sync(chat_id) else "Подключённых сообществ пока нет.")

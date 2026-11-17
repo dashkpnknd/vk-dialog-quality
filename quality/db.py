@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS sync_jobs (
 CREATE INDEX IF NOT EXISTS idx_sync_jobs_ready ON sync_jobs(lease_until,priority,requested_at);
 CREATE INDEX IF NOT EXISTS idx_observations_first_at ON observations(first_at,group_id);
 CREATE INDEX IF NOT EXISTS idx_observations_group_first_at ON observations(group_id,first_at);
+CREATE INDEX IF NOT EXISTS idx_observations_label_first_at ON observations(label_id,first_at);
 CREATE INDEX IF NOT EXISTS idx_groups_project ON groups(project);
 CREATE TABLE IF NOT EXISTS report_delivery_state (
     group_id INTEGER PRIMARY KEY,
@@ -101,7 +102,7 @@ CREATE TABLE IF NOT EXISTS report_delivery_state (
 );
 """
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def connect(path: str) -> sqlite3.Connection:

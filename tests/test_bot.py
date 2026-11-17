@@ -159,6 +159,60 @@ class BotTests(unittest.TestCase):
             self.assertIn("поставлено в очередь", api.messages[-2][1])
             self.assertIn("Выберите магазин", api.messages[-1][1])
 
+    def test_campaign_id_search_keeps_same_id_separate_by_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "quality.sqlite3")
+            from time import time
+            now = int(time())
+            with connect(path) as db:
+                for group_id, project, peer, message in (
+                    (42, "Магазин А", 100, {"text": "Сколько стоит?"}),
+                    (43, "Магазин Б", 101, {"text": "Узнать цену", "payload": "{}"}),
+                ):
+                    db.execute("INSERT INTO groups(group_id,project,token) VALUES (?,?,?)",
+                               (group_id, project, "secret"))
+                    db.execute("INSERT INTO group_sync_state(group_id,started_at,completed_at) VALUES (?,?,?)",
+                               (group_id, 1, 2))
+                    item = episodes(peer, [{"id": 1, "date": now, "out": 0,
+                                           "ref": "Из VK Рекламы 248543102", **message}],
+                                    DEFAULT_SETTINGS, now)[0]
+                    save_observation(db, group_id, item, now)
+                db.execute("INSERT INTO authorized_users(user_id,authorized_at) VALUES (999,1)")
+                db.commit()
+            api = FakeTelegram()
+            bot = ReportBot(path, api)
+            bot.handle({"message": {"chat": {"id": 999, "type": "private"},
+                                    "text": "🎯 Кампании"}})
+            self.assertIn("Отправьте числовой рекламный ID", api.messages[-1][1])
+            bot.handle({"message": {"chat": {"id": 999, "type": "private"},
+                                    "text": "248543102"}})
+            result = api.messages[-1][1]
+            self.assertIn("Магазин А", result)
+            self.assertIn("Магазин Б", result)
+            self.assertIn("Квалы: <b>1</b> (100,0%) · не квалы: <b>0</b>", result)
+            self.assertIn("Квалы: <b>0</b> (0,0%) · не квалы: <b>1</b>", result)
+            bot.handle({"message": {"chat": {"id": 999, "type": "private"},
+                                    "text": "/campaign 111"}})
+            self.assertIn("обращений пока нет", api.messages[-1][1])
+
+    def test_campaign_search_in_connected_general_topic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "quality.sqlite3")
+            with connect(path) as db:
+                db.execute("INSERT INTO report_chats(chat_id,title,connected_at) VALUES (-100123,'Отчёт',1)")
+                db.execute("INSERT INTO authorized_users(user_id,authorized_at) VALUES (999,1)")
+                db.commit()
+            api = FakeTelegram()
+            bot = ReportBot(path, api)
+            bot.handle({"callback_query": {"id": "callback", "from": {"id": 999},
+                                           "data": "g:campaign",
+                                           "message": {"chat": {"id": -100123, "type": "supergroup"}}}})
+            self.assertTrue(api.markups[-1]["force_reply"])
+            bot.handle({"message": {"chat": {"id": -100123, "type": "supergroup"},
+                                    "from": {"id": 999}, "text": "248543102",
+                                    "reply_to_message": {"text": api.messages[-1][1]}}})
+            self.assertIn("обращений пока нет", api.messages[-1][1])
+
     def test_report_requested_during_daily_sync_is_queued(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "quality.sqlite3")

@@ -35,6 +35,9 @@ class FakeForumAPI:
     def edit_topic(self, chat_id, thread_id, name):
         self.edits.append((chat_id, thread_id, name))
 
+    def edit_markup(self, chat_id, message_id, reply_markup):
+        self.edits.append((chat_id, message_id, reply_markup))
+
     def send(self, chat_id, text, keyboard=False, thread_id=None, parse_mode=None, reply_markup=None):
         self.messages.append((chat_id, text, thread_id, parse_mode))
         return {"message_id": 1000 + len(self.messages)}

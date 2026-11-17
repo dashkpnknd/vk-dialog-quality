@@ -28,6 +28,25 @@ def date_bounds(db: sqlite3.Connection, days: int) -> Tuple[int, int]:
     return int(start.timestamp()), int(end.timestamp())
 
 
+def campaign_rows(db: sqlite3.Connection, label_id: str, days: int = 30) -> List[Dict]:
+    """Find an ad marker across all connected groups without assuming global uniqueness."""
+    start, end = date_bounds(db, days)
+    return [dict(row) for row in db.execute("""
+        SELECT g.project, o.group_id, COUNT(*) AS total,
+               SUM(o.status='qualified') AS qualified,
+               SUM(o.status='not_qualified') AS not_qualified,
+               SUM(o.status='review') AS review,
+               MIN(o.first_at) AS first_at, MAX(o.first_at) AS last_at
+        FROM observations o
+        JOIN groups g ON g.group_id=o.group_id
+        JOIN group_sync_state s ON s.group_id=g.group_id
+        WHERE o.label_id=? AND o.first_at>=? AND o.first_at<?
+          AND g.enabled=1 AND s.completed_at IS NOT NULL
+        GROUP BY o.group_id, g.project
+        ORDER BY total DESC, g.project, o.group_id
+    """, (label_id, start, end))]
+
+
 def report_data(db: sqlite3.Connection, days: int = 30,
                 complete_only: bool = False, project_names=None,
                 include_daily: bool = True) -> Tuple[List[Dict], List[Dict]]:
