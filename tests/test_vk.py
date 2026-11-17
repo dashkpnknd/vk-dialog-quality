@@ -1,9 +1,44 @@
 import unittest
+from unittest.mock import patch
 
-from quality.vk import VKClient
+from quality.vk import VKClient, VKError, group_from_token
+
+
+class VKIdentityTests(unittest.TestCase):
+    @patch("quality.vk.requests.post")
+    def test_discovers_community_from_token_alone(self, post):
+        post.return_value.json.return_value = {
+            "response": {"groups": [{"id": 240453069, "name": "9:41 Store | Калуга"}]}}
+        self.assertEqual(group_from_token("secret"), (240453069, "9:41 Store | Калуга"))
+        self.assertEqual(post.call_args.kwargs["data"],
+                         {"access_token": "secret", "v": "5.199"})
+
+    @patch("quality.vk.requests.post")
+    def test_invalid_token_is_rejected(self, post):
+        post.return_value.json.return_value = {
+            "error": {"error_code": 5, "error_msg": "Invalid access token"}}
+        with self.assertRaises(VKError):
+            group_from_token("bad")
 
 
 class VKHistoryTests(unittest.TestCase):
+    def test_batch_reads_short_histories_and_falls_back_for_long_one(self):
+        client = VKClient("secret", 42)
+        calls = []
+        def fake_call(method, **params):
+            calls.append(method)
+            if method == "execute":
+                self.assertIn("API.messages.getHistory", params["code"])
+                return [{"count": 2, "items": [{"id": 2, "date": 200}, {"id": 1, "date": 100}]},
+                        {"count": 101, "items": [{"id": 3, "date": 300}]}]
+            return {"count": 1, "items": [{"id": 3, "date": 300}]}
+        client.call = fake_call
+        histories = client.histories_since([(123, 150), (456, 150)])
+        self.assertEqual([item["id"] for item in histories[123][0]], [2])
+        self.assertTrue(histories[123][1])
+        self.assertEqual([item["id"] for item in histories[456][0]], [3])
+        self.assertEqual(calls, ["execute", "messages.getHistory"])
+
     def test_reads_recent_messages_backwards_and_returns_chronological_order(self):
         client = VKClient("secret", 42)
         calls = []

@@ -2,6 +2,7 @@ import csv
 import io
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Tuple
@@ -27,9 +28,19 @@ def date_bounds(db: sqlite3.Connection, days: int) -> Tuple[int, int]:
     return int(start.timestamp()), int(end.timestamp())
 
 
-def report_data(db: sqlite3.Connection, days: int = 30) -> Tuple[List[Dict], List[Dict]]:
+def report_data(db: sqlite3.Connection, days: int = 30,
+                complete_only: bool = False, project_names=None,
+                include_daily: bool = True) -> Tuple[List[Dict], List[Dict]]:
     start, end = date_bounds(db, days)
-    return rows(db, start, end), daily_rows(db, start, end, settings(db)["timezone"])
+    summary = rows(db, start, end, project_names)
+    daily = daily_rows(db, start, end, settings(db)["timezone"], project_names) if include_daily else []
+    if complete_only:
+        completed = {row["group_id"] for row in db.execute(
+            "SELECT g.group_id FROM groups g JOIN group_sync_state s ON s.group_id=g.group_id "
+            "WHERE g.enabled=1 AND s.completed_at IS NOT NULL")}
+        summary = [item for item in summary if item["group_id"] in completed]
+        daily = [item for item in daily if item["group_id"] in completed]
+    return summary, daily
 
 
 def csv_text(items: List[Dict[str, Any]], daily: bool = False) -> str:
@@ -46,10 +57,15 @@ def csv_text(items: List[Dict[str, Any]], daily: bool = False) -> str:
 def _request(method: str, url: str, credentials, **kwargs):
     if not credentials.valid:
         credentials.refresh(Request())
-    response = requests.request(method, url, headers={"Authorization": "Bearer " + credentials.token},
-                                timeout=30, **kwargs)
-    response.raise_for_status()
-    return response.json() if response.content else {}
+    for attempt in range(4):
+        response = requests.request(method, url, headers={"Authorization": "Bearer " + credentials.token},
+                                    timeout=60, **kwargs)
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+            time.sleep(2 ** attempt)
+            continue
+        response.raise_for_status()
+        return response.json() if response.content else {}
+    raise RuntimeError("Google Sheets request retries exhausted")
 
 
 def publish_google(db: sqlite3.Connection, days: int = 30) -> str:
@@ -66,7 +82,7 @@ def publish_google(db: sqlite3.Connection, days: int = 30) -> str:
     if missing:
         _request("POST", base + ":batchUpdate", credentials,
                  json={"requests": [{"addSheet": {"properties": {"title": name}}} for name in missing]})
-    summary, daily = report_data(db, days)
+    summary, daily = report_data(db, days, complete_only=True)
     values = [
         ("Сводка", [HEADERS] + [[item[field] for field in FIELDS] for item in summary]),
         ("По дням", [DAILY_HEADERS] + [[item["day"]] + [item[field] for field in FIELDS] for item in daily]),
@@ -74,7 +90,11 @@ def publish_google(db: sqlite3.Connection, days: int = 30) -> str:
     for title, table in values:
         clear_range = requests.utils.quote("'" + title + "'!A:Z", safe="")
         _request("POST", base + "/values/" + clear_range + ":clear", credentials, json={})
-        encoded = requests.utils.quote("'" + title + "'!A1", safe="")
-        _request("PUT", base + "/values/" + encoded + "?valueInputOption=RAW", credentials,
-                 json={"range": "'" + title + "'!A1", "majorDimension": "ROWS", "values": table})
+        for start in range(0, len(table), 5000):
+            chunks = []
+            for offset in range(start, min(start + 5000, len(table)), 1000):
+                chunks.append({"range": "'{}'!A{}".format(title, offset + 1),
+                               "majorDimension": "ROWS", "values": table[offset:offset + 1000]})
+            _request("POST", base + "/values:batchUpdate", credentials,
+                     json={"valueInputOption": "RAW", "data": chunks})
     return "https://docs.google.com/spreadsheets/d/" + spreadsheet_id

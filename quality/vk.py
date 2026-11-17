@@ -1,3 +1,4 @@
+import json
 import time
 from typing import Any, Dict, Iterator, List, Tuple
 import requests
@@ -5,6 +6,24 @@ import requests
 
 class VKError(RuntimeError):
     pass
+
+
+def group_from_token(token: str, api_version: str = "5.199") -> Tuple[int, str]:
+    """Resolve the community that owns a token without asking for its ID."""
+    try:
+        response = requests.post("https://api.vk.com/method/groups.getById",
+                                 data={"access_token": token, "v": api_version}, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise VKError("Не удалось связаться с VK: " + str(exc)) from exc
+    if "error" in data:
+        error = data["error"]
+        raise VKError("VK API {}: {}".format(error.get("error_code"), error.get("error_msg")))
+    groups = data.get("response", {}).get("groups", [])
+    if len(groups) != 1 or not groups[0].get("id") or not groups[0].get("name"):
+        raise VKError("VK не вернул сообщество для этого ключа")
+    return int(groups[0]["id"]), str(groups[0]["name"]).strip()
 
 
 class VKClient:
@@ -87,3 +106,35 @@ class VKClient:
             if not items or offset >= int(response.get("count", offset)):
                 return list(reversed(result)), False, False
         return list(reversed(result)), True, True
+
+    def histories_since(self, peers: List[Tuple[int, int]]) -> Dict[int, Tuple[List[Dict[str, Any]], bool, bool]]:
+        """Read the first history page for several chats in one VK execute call.
+
+        Long histories and failed subcalls use the regular paginated reader.
+        """
+        if not peers:
+            return {}
+        ids = [peer_id for peer_id, _ in peers]
+        code = ("var ids = " + json.dumps(ids) + "; var result = []; var i = 0; "
+                "while (i < ids.length) { result.push(API.messages.getHistory({peer_id: ids[i], "
+                "count: 100, group_id: " + str(self.group_id) + "})); i = i + 1; } return result;")
+        try:
+            pages = self.call("execute", code=code)
+        except VKError:
+            pages = None
+        if not isinstance(pages, list) or len(pages) != len(peers):
+            pages = [None] * len(peers)
+        result = {}
+        for (peer_id, since), page in zip(peers, pages):
+            if not isinstance(page, dict) or not isinstance(page.get("items"), list):
+                result[peer_id] = self.history_since(peer_id, since)
+                continue
+            items = page["items"]
+            recent = [item for item in items if int(item.get("date") or 0) >= since]
+            if items and int(items[-1].get("date") or 0) < since:
+                result[peer_id] = (list(reversed(recent)), True, False)
+            elif len(items) >= int(page.get("count", len(items))):
+                result[peer_id] = (list(reversed(recent)), False, False)
+            else:
+                result[peer_id] = self.history_since(peer_id, since)
+        return result

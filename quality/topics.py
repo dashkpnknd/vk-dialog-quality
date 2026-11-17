@@ -33,11 +33,18 @@ def _percent(qualified: int, total: int) -> str:
     return ("{:.1f}".format(100 * qualified / total) if total else "0.0").replace(".", ",")
 
 
+def report_date_range(db: sqlite3.Connection, days: int = 30) -> str:
+    start, end = date_bounds(db, days)
+    zone = ZoneInfo(settings(db)["timezone"])
+    return "{}–{}".format(datetime.fromtimestamp(start, zone).strftime("%d.%m"),
+                          datetime.fromtimestamp(end - 1, zone).strftime("%d.%m"))
+
+
 def format_project_report(project: str, period: List[Dict[str, Any]],
                           date_range: str) -> List[str]:
     """Return compact, self-contained HTML messages below Telegram's limit."""
     month = _total(period)
-    header = "📊 <b>VK КВАЛЫ</b>\n🏪 <b>{}</b>\n📅 Последние 30 дней: {}\n━━━━━━━━━━━━━━━━━━━━\n".format(
+    header = "📊 <b>VK КВАЛЫ</b>\n<b>{}</b>\nПоследние 30 дней: {}\n━━━━━━━━━━━━━━━━━━━━\n".format(
         escape(project), escape(date_range))
     lines = [
         "👥 Обращения: <b>{}</b>".format(month["total"]),
@@ -52,17 +59,17 @@ def format_project_report(project: str, period: List[Dict[str, Any]],
         labels[item["label_id"]].append(item)
     campaign_ids = sorted((key for key in labels if key != "Без метки"),
                           key=lambda key: (-_total(labels[key])["total"], key))
-    if campaign_ids:
+    if labels:
         lines.extend(("", "🎯 <b>Рекламные ID</b>", "Квалы из всех обращений:"))
-        for label in campaign_ids:
-            item = _total(labels[label])
-            lines.append("• <code>{}</code> — <b>{} из {}</b> · {}%".format(
-                escape(label), item["qualified"], item["total"],
-                _percent(item["qualified"], item["total"])))
+    for label in campaign_ids:
+        item = _total(labels[label])
+        lines.append("• <code>{}</code> — <b>{} из {}</b> ({}%)".format(
+            escape(label), item["qualified"], item["total"],
+            _percent(item["qualified"], item["total"])))
     if "Без метки" in labels:
         item = _total(labels["Без метки"])
-        lines.extend(("", "▫️ <b>Без метки:</b> {} из {} · {}%".format(
-            item["qualified"], item["total"], _percent(item["qualified"], item["total"]))))
+        lines.append("• Без метки — <b>{} из {}</b> ({}%)".format(
+            item["qualified"], item["total"], _percent(item["qualified"], item["total"])))
     parts: List[str] = []
     current = header
     for line in lines:
@@ -75,16 +82,17 @@ def format_project_report(project: str, period: List[Dict[str, Any]],
 
 
 def publish_project_reports(db: sqlite3.Connection, api: Any,
-                            chat_id: Optional[int] = None) -> Dict[str, int]:
+                            chat_id: Optional[int] = None,
+                            project_names=None) -> Dict[str, int]:
     """Reuse existing topics, renaming old city topics to store names."""
     chats = list(db.execute("SELECT chat_id FROM report_chats WHERE chat_id=?", (chat_id,))) if chat_id else \
         list(db.execute("SELECT chat_id FROM report_chats ORDER BY connected_at"))
-    period, _ = report_data(db, 30)
-    start, end = date_bounds(db, 30)
-    zone = ZoneInfo(settings(db)["timezone"])
-    date_range = "{}–{}".format(datetime.fromtimestamp(start, zone).strftime("%d.%m"),
-                                datetime.fromtimestamp(end - 1, zone).strftime("%d.%m"))
+    period, _ = report_data(db, 30, complete_only=True,
+                            project_names=project_names, include_daily=False)
+    date_range = report_date_range(db)
     projects = sorted({item["project"] for item in period})
+    if project_names is not None:
+        projects = [project for project in projects if project in project_names]
     result = {"topics": 0, "reports": 0}
     for chat in chats:
         target = chat["chat_id"]

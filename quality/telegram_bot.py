@@ -1,6 +1,8 @@
 """Telegram interface for VK quality reports and city forum topics."""
 
 from datetime import datetime
+import hmac
+from html import escape
 import json
 import os
 import sqlite3
@@ -13,8 +15,9 @@ import requests
 
 from .db import connect, settings as get_settings
 from .report import csv_text, report_data, publish_google
-from .sync import sync_all
-from .topics import publish_project_reports
+from .jobs import enqueue_groups
+from .topics import format_project_report, publish_project_reports, report_date_range
+from .vk import VKClient, VKError, group_from_token
 
 
 class TelegramError(RuntimeError):
@@ -28,19 +31,28 @@ class TelegramAPI:
         self.base = "https://api.telegram.org/bot" + token + "/"
 
     def call(self, method: str, **params: Any) -> Any:
-        try:
-            response = requests.post(self.base + method, json=params, timeout=45)
-            response.raise_for_status()
-            payload = response.json()
-        except (requests.RequestException, ValueError) as exc:
-            # Do not include the request URL: it contains the bot token.
-            raise TelegramError("Telegram request failed") from None
-        if not payload.get("ok"):
+        for attempt in range(5):
+            try:
+                response = requests.post(self.base + method, json=params, timeout=45)
+                payload = response.json()
+            except (requests.RequestException, ValueError):
+                # The request URL contains the bot token and must never appear in an error.
+                if attempt < 4:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise TelegramError("Telegram request failed") from None
+            if payload.get("ok"):
+                return payload.get("result")
+            retry_after = (payload.get("parameters") or {}).get("retry_after")
+            if retry_after and attempt < 4:
+                time.sleep(min(max(int(retry_after), 1), 120))
+                continue
             raise TelegramError("Telegram API error: " + str(payload.get("description", "unknown")))
-        return payload.get("result")
+        raise TelegramError("Telegram request retries exhausted")
 
     def send(self, chat_id: int, text: str, keyboard: bool = False,
-             thread_id: Optional[int] = None, parse_mode: Optional[str] = None) -> None:
+             thread_id: Optional[int] = None, parse_mode: Optional[str] = None,
+             reply_markup: Optional[Dict[str, Any]] = None) -> Any:
         params = {"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True}
         if thread_id is not None:
             params["message_thread_id"] = thread_id
@@ -48,10 +60,28 @@ class TelegramAPI:
             params["parse_mode"] = parse_mode
         if keyboard:
             params["reply_markup"] = {"keyboard": [
-                [{"text": "📊 Отчёт"}, {"text": "🔄 Обновить"}],
-                [{"text": "🏪 Проекты"}, {"text": "➕ Проект"}, {"text": "➕ Группа"}],
-                [{"text": "📄 Таблица"}, {"text": "ℹ️ Помощь"}]], "resize_keyboard": True}
-        self.call("sendMessage", **params)
+                [{"text": "📊 Отчёт"}],
+                [{"text": "🏪 Проекты"}, {"text": "➕ Подключить VK"}],
+                [{"text": "📄 Таблица"}]], "resize_keyboard": True}
+        if reply_markup:
+            params["reply_markup"] = reply_markup
+        return self.call("sendMessage", **params)
+
+    def edit(self, chat_id: int, message_id: int, text: str,
+             reply_markup: Dict[str, Any]) -> None:
+        self.call("editMessageText", chat_id=chat_id, message_id=message_id,
+                  text=text, parse_mode="HTML", reply_markup=reply_markup)
+
+    def answer_callback(self, callback_id: str, text: Optional[str] = None) -> None:
+        params = {"callback_query_id": callback_id}
+        if text:
+            params["text"] = text
+            params["show_alert"] = True
+        self.call("answerCallbackQuery", **params)
+
+    def pin(self, chat_id: int, message_id: int) -> None:
+        self.call("pinChatMessage", chat_id=chat_id, message_id=message_id,
+                  disable_notification=True)
 
     def create_topic(self, chat_id: int, name: str) -> int:
         topic = self.call("createForumTopic", chat_id=chat_id, name=name[:128])
@@ -88,7 +118,7 @@ def _set_setting(db: sqlite3.Connection, key: str, value: Any) -> None:
 
 
 def summary(db: sqlite3.Connection, days: int = 30) -> str:
-    rows, _ = report_data(db, days)
+    rows, _ = report_data(db, days, complete_only=True, include_daily=False)
     if not rows:
         return "За выбранный период данных пока нет. Добавьте сообщества и запустите /sync."
     total = sum(row["total"] for row in rows)
@@ -108,9 +138,6 @@ def summary(db: sqlite3.Connection, days: int = 30) -> str:
                                                  round(100 * item["qualified"] / item["total"], 1)))
     if len(projects) > 30:
         lines.append("Ещё {} магазинов — в Google-таблице.".format(len(projects) - 30))
-    lines.append("\nРезультат пересчитывается, если клиент ответит позже.")
-    if review:
-        lines.append("Часть обращений требует проверки из-за кнопок бота.")
     spreadsheet_id = os.environ.get("GOOGLE_SPREADSHEET_ID")
     if spreadsheet_id:
         lines.append("\nТаблица: https://docs.google.com/spreadsheets/d/" + spreadsheet_id)
@@ -121,7 +148,8 @@ def group_summary(db: sqlite3.Connection, group_id: int) -> str:
     group = db.execute("SELECT project FROM groups WHERE group_id=?", (group_id,)).fetchone()
     if group is None:
         return "Такое сообщество не добавлено. Команда /groups покажет список."
-    rows, _ = report_data(db, 30)
+    rows, _ = report_data(db, 30, complete_only=True,
+                          project_names={group["project"]}, include_daily=False)
     group_rows = [row for row in rows if row["group_id"] == group_id]
     if not group_rows:
         return "{}: за 30 дней данных пока нет.".format(group["project"])
@@ -133,12 +161,74 @@ def group_summary(db: sqlite3.Connection, group_id: int) -> str:
 
 
 class ReportBot:
-    def __init__(self, db_path: str, api: Optional[TelegramAPI] = None):
+    def __init__(self, db_path: str, api: Optional[TelegramAPI] = None,
+                 access_code: Optional[str] = None):
         self.db_path = db_path
         self.api = api or TelegramAPI(os.environ.get("TELEGRAM_BOT_TOKEN", ""))
-        self.sync_lock = threading.Lock()
+        self.access_code = access_code if access_code is not None else os.environ.get("BOT_ACCESS_CODE", "")
+        if not self.access_code and api is None:
+            raise ValueError("Set BOT_ACCESS_CODE")
         self.status = "Сбор ещё не запускался в этой сессии."
         self.pending: Dict[int, str] = {}
+
+    @staticmethod
+    def _authorized(db: sqlite3.Connection, user_id: Optional[int]) -> bool:
+        return isinstance(user_id, int) and db.execute(
+            "SELECT 1 FROM authorized_users WHERE user_id=?", (user_id,)).fetchone() is not None
+
+    def _authorize(self, db: sqlite3.Connection, user_id: int, code: str) -> str:
+        now = int(time.time())
+        previous = db.execute("SELECT window_started_at,attempts FROM auth_attempts WHERE user_id=?",
+                              (user_id,)).fetchone()
+        recent = previous and now - previous["window_started_at"] < 3600
+        if recent and previous["attempts"] >= 5:
+            return "blocked"
+        if self.access_code and hmac.compare_digest(code.encode("utf-8"),
+                                                    self.access_code.encode("utf-8")):
+            db.execute("INSERT OR REPLACE INTO authorized_users(user_id,authorized_at) VALUES (?,?)",
+                       (user_id, now))
+            db.execute("DELETE FROM auth_attempts WHERE user_id=?", (user_id,))
+            db.commit()
+            return "ok"
+        started_at = previous["window_started_at"] if recent else now
+        attempts = previous["attempts"] + 1 if recent else 1
+        db.execute("INSERT INTO auth_attempts(user_id,window_started_at,attempts) VALUES (?,?,?) "
+                   "ON CONFLICT(user_id) DO UPDATE SET window_started_at=excluded.window_started_at,"
+                   "attempts=excluded.attempts", (user_id, started_at, attempts))
+        db.commit()
+        return "invalid"
+
+    @staticmethod
+    def _general_markup() -> Dict[str, Any]:
+        return {"inline_keyboard": [
+            [{"text": "📊 Отчёт", "callback_data": "g:report"},
+             {"text": "🏪 Проекты", "callback_data": "g:projects"}],
+            [{"text": "📄 Таблица", "callback_data": "g:sheet"}]]}
+
+    def ensure_general_panel(self, db: sqlite3.Connection, chat_id: int) -> bool:
+        """Create one persistent General-topic control message per connected chat."""
+        panel = db.execute("SELECT message_id,pinned FROM general_panels WHERE chat_id=?",
+                           (chat_id,)).fetchone()
+        if panel is None:
+            message = self.api.send(chat_id, "📊 <b>VK КВАЛЫ</b>\nОтчёты по магазинам",
+                                    parse_mode="HTML", reply_markup=self._general_markup())
+            if not isinstance(message, dict) or not isinstance(message.get("message_id"), int):
+                raise TelegramError("Telegram не вернул ID панели General")
+            message_id = message["message_id"]
+            db.execute("INSERT INTO general_panels(chat_id,message_id,pinned) VALUES (?,?,0)",
+                       (chat_id, message_id))
+            db.commit()
+        else:
+            message_id = panel["message_id"]
+            if panel["pinned"]:
+                return True
+        try:
+            self.api.pin(chat_id, message_id)
+        except TelegramError:
+            return False
+        db.execute("UPDATE general_panels SET pinned=1 WHERE chat_id=?", (chat_id,))
+        db.commit()
+        return True
 
     def _send_long(self, chat_id: int, text: str) -> None:
         part = ""
@@ -150,66 +240,132 @@ class ReportBot:
         if part:
             self.api.send(chat_id, part)
 
-    def _send_subscribers(self, text: str) -> None:
+    def start_sync(self, reply_to: Optional[int], group_ids=None, priority=None) -> bool:
         with connect(self.db_path) as db:
-            subscribers = [row["chat_id"] for row in db.execute("SELECT chat_id FROM subscribers")]
-        for chat_id in subscribers:
-            try:
-                self.api.send(chat_id, text)
-            except TelegramError:
-                pass
+            queued = enqueue_groups(db, group_ids, priority=(priority if priority is not None else
+                                                           (1 if reply_to is not None else 0)))
+        self.status = "В очереди на обновление: {} сообществ.".format(queued)
+        return queued > 0
 
-    def _run_sync(self, reply_to: Optional[int]) -> None:
+    def _report_menu(self, db: sqlite3.Connection, page: int = 0) -> tuple:
+        projects = list(db.execute(
+            "SELECT project, MIN(group_id) AS group_id FROM groups GROUP BY project ORDER BY project"))
+        page_count = max(1, (len(projects) + 7) // 8)
+        page = min(max(page, 0), page_count - 1)
+        period, _ = report_data(db, 30, complete_only=True, include_daily=False)
+        completed = db.execute("SELECT COUNT(*) FROM groups g JOIN group_sync_state s "
+                               "ON s.group_id=g.group_id WHERE g.enabled=1 AND s.completed_at IS NOT NULL "
+                               ).fetchone()[0]
+        enabled = db.execute("SELECT COUNT(*) FROM groups WHERE enabled=1").fetchone()[0]
+        running = db.execute("SELECT COUNT(*) FROM group_sync_state WHERE running=1").fetchone()[0]
+        scanned = db.execute("SELECT COALESCE(SUM(scanned),0) FROM group_sync_state WHERE running=1").fetchone()[0]
+        failed = db.execute("SELECT COUNT(*) FROM group_sync_state WHERE last_error IS NOT NULL").fetchone()[0]
+        total = sum(int(row["total"]) for row in period)
+        qualified = sum(int(row["qualified"]) for row in period)
+        not_qualified = sum(int(row["not_qualified"]) for row in period)
+        review = sum(int(row["review"]) for row in period)
+        percent = "{:.1f}".format(100 * qualified / total if total else 0).replace(".", ",")
+        text = ("📊 <b>VK КВАЛЫ</b>\nПоследние 30 дней: {}\n━━━━━━━━━━━━━━━━━━━━\n"
+                "🏪 Магазинов: <b>{}</b>\n👥 Обращения: <b>{}</b>\n"
+                "✅ Квалы: <b>{}</b> (<b>{}%</b>)\n❌ Не квалы: <b>{}</b>").format(
+                    report_date_range(db), len(projects), total, qualified, percent, not_qualified)
+        if review:
+            text += "\n⚠️ На проверке: <b>{}</b>".format(review)
+        if completed < enabled:
+            text += "\n⏳ Полный сбор завершён: <b>{} из {}</b> сообществ".format(completed, enabled)
+        if running:
+            text += "\n🔄 Обновляются: <b>{}</b> сообществ · проверено чатов: <b>{}</b>".format(running, scanned)
+        if failed:
+            text += "\n⚠️ Ошибки обновления: <b>{}</b> сообществ (повторятся автоматически)".format(failed)
+        text += "\n\nВыберите магазин:"
+        if not projects:
+            text += "\nПока нет подключённых сообществ."
+        buttons = [[{"text": row["project"][:48],
+                     "callback_data": "r:g:{}:{}".format(row["group_id"], page)}]
+                   for row in projects[page * 8:(page + 1) * 8]]
+        if page_count > 1:
+            navigation = []
+            if page:
+                navigation.append({"text": "◀️", "callback_data": "r:p:{}".format(page - 1)})
+            navigation.append({"text": "{}/{}".format(page + 1, page_count),
+                               "callback_data": "r:p:{}".format(page)})
+            if page + 1 < page_count:
+                navigation.append({"text": "▶️", "callback_data": "r:p:{}".format(page + 1)})
+            buttons.append(navigation)
+        return text, {"inline_keyboard": buttons}
+
+    def _handle_callback(self, query: Dict[str, Any]) -> None:
+        callback_id = query.get("id")
+        message = query.get("message") or {}
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        actor_id = (query.get("from") or {}).get("id")
+        if not isinstance(chat_id, int):
+            return
+        with connect(self.db_path) as db:
+            allowed = self._authorized(db, actor_id)
+            if chat.get("type") in ("group", "supergroup"):
+                allowed = allowed and db.execute(
+                    "SELECT 1 FROM report_chats WHERE chat_id=?", (chat_id,)).fetchone() is not None
+        if not allowed:
+            if callback_id:
+                self.api.answer_callback(str(callback_id), "Откройте бота в личном чате и введите команду доступа.")
+            return
+        if callback_id:
+            self.api.answer_callback(str(callback_id))
+        data = str(query.get("data") or "")
+        if chat.get("type") in ("group", "supergroup") and data.startswith("g:"):
+            if data == "g:report":
+                started = self.start_sync(chat_id)
+                self.api.send(chat_id, "Обновление VK поставлено в очередь. Готовые отчёты появятся в темах."
+                              if started else "Подключённых сообществ пока нет.")
+                with connect(self.db_path) as db:
+                    menu, markup = self._report_menu(db)
+                self.api.send(chat_id, menu, parse_mode="HTML", reply_markup=markup)
+            elif data == "g:projects":
+                with connect(self.db_path) as db:
+                    text, markup = self._report_menu(db)
+                self.api.send(chat_id, text, parse_mode="HTML", reply_markup=markup)
+            elif data == "g:sheet":
+                spreadsheet_id = os.environ.get("GOOGLE_SPREADSHEET_ID")
+                self.api.send(chat_id, "https://docs.google.com/spreadsheets/d/" + spreadsheet_id
+                              if spreadsheet_id else "Google-таблица ещё не подключена.")
+            return
+        parts = str(query.get("data") or "").split(":")
+        if len(parts) < 3 or parts[0] != "r":
+            return
         try:
-            with connect(self.db_path) as db:
-                result = sync_all(db)
-                errors = [item for item in result if "error" in item]
-                incomplete = sum(item.get("incomplete", 0) for item in result)
-                if not result:
-                    text = "Сообщества пока не добавлены."
-                else:
-                    text = "Сбор завершён: {} сообществ, {} ошибок.".format(len(result), len(errors))
-                    if errors:
-                        text += "\n" + "\n".join("{}: {}".format(item["project"], item["error"]) for item in errors[:5])
-                    if incomplete:
-                        text += "\nИстория {} диалогов превысила предел чтения; они не учтены и требуют отдельной проверки.".format(incomplete)
-                    if (not errors and os.environ.get("GOOGLE_SPREADSHEET_ID") and
-                            os.path.isfile(os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", ""))):
-                        try:
-                            publish_google(db)
-                            text += "\nGoogle-таблица обновлена."
-                        except Exception as exc:
-                            text += "\nОшибка записи в Google-таблицу: " + str(exc)
-                    if not errors:
-                        try:
-                            posted = publish_project_reports(db, self.api)
-                            if posted["reports"]:
-                                text += "\nОтчёты отправлены в темы городов: {}.".format(posted["reports"])
-                        except Exception as exc:
-                            text += "\nОшибка отправки в темы городов: " + str(exc)
-                    text += "\n\n" + summary(db, 30)
-            self.status = text.split("\n", 1)[0]
-            if reply_to is None:
-                self._send_subscribers(text)
-            else:
-                self.api.send(reply_to, text)
-        except Exception as exc:
-            self.status = "Ошибка сбора: " + str(exc)
-            if reply_to is None:
-                self._send_subscribers(self.status)
-            else:
-                self.api.send(reply_to, self.status)
-        finally:
-            self.sync_lock.release()
-
-    def start_sync(self, reply_to: Optional[int]) -> bool:
-        if not self.sync_lock.acquire(blocking=False):
-            return False
-        self.status = "Сбор выполняется."
-        threading.Thread(target=self._run_sync, args=(reply_to,), daemon=True).start()
-        return True
+            value = int(parts[2])
+        except ValueError:
+            return
+        with connect(self.db_path) as db:
+            if parts[1] == "p":
+                text, markup = self._report_menu(db, value)
+                self.api.edit(chat_id, int(message["message_id"]), text, markup)
+            elif parts[1] == "g":
+                row = db.execute("SELECT project FROM groups WHERE group_id=?", (value,)).fetchone()
+                if not row:
+                    self.api.send(chat_id, "Магазин не найден. Откройте «📊 Отчёт» ещё раз.")
+                    return
+                page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+                period, _ = report_data(db, 30, complete_only=True,
+                                        project_names={row["project"]}, include_daily=False)
+                if not any(item["project"] == row["project"] for item in period):
+                    self.api.send(chat_id, "Для этого магазина полный сбор ещё не завершён.")
+                    return
+                reports = format_project_report(
+                    row["project"], [item for item in period if item["project"] == row["project"]],
+                    report_date_range(db))
+                back = {"inline_keyboard": [[{"text": "⬅️ К магазинам",
+                                             "callback_data": "r:p:{}".format(page)}]]}
+                for index, report in enumerate(reports):
+                    self.api.send(chat_id, report, parse_mode="HTML",
+                                  reply_markup=back if index == len(reports) - 1 else None)
 
     def handle(self, update: Dict[str, Any]) -> None:
+        if "callback_query" in update:
+            self._handle_callback(update["callback_query"])
+            return
         message = update.get("message") or {}
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
@@ -222,6 +378,20 @@ class ReportBot:
             if mentioned_bot and mentioned_bot.casefold() != "vk_dialog_quality_report_bot":
                 return
             command = command.lower()
+            if command.startswith("/start") and command != "/start":
+                try:
+                    self.api.delete(chat_id, int(message["message_id"]))
+                except (KeyError, TelegramError):
+                    pass
+                self.api.send(chat_id, "Команду доступа отправьте боту в личном чате.")
+                return
+            if command not in ("/connect", "/report"):
+                return
+            user_id = (message.get("from") or {}).get("id")
+            with connect(self.db_path) as db:
+                if not self._authorized(db, user_id):
+                    self.api.send(chat_id, "Сначала откройте бота в личном чате и введите команду доступа.")
+                    return
             if command == "/connect":
                 info = self.api.call("getChat", chat_id=chat_id)
                 if not info.get("is_forum"):
@@ -240,24 +410,50 @@ class ReportBot:
                                (chat_id, str(info.get("title") or chat.get("title") or "Отчёты"), int(time.time())))
                     db.commit()
                     posted = publish_project_reports(db, self.api, chat_id) if not already_connected else None
+                    pinned = self.ensure_general_panel(db, chat_id)
                 if posted:
                     self.api.send(chat_id, "Чат подключён. Создано тем: {}. Отправлено отчётов: {}. "
-                                  "Новые отчёты будут приходить после ежедневного сбора; /report отправит текущие данные.".format(
-                                      posted["topics"], posted["reports"]))
+                                  "Новые отчёты будут приходить ежедневно после 10:00 МСК. Панель в General {}.".format(
+                                      posted["topics"], posted["reports"],
+                                      "закреплена" if pinned else "отправлена, но не закреплена"))
                 else:
-                    self.api.send(chat_id, "Чат уже подключён. Чтобы получить текущий отчёт, отправьте /report.")
+                    self.api.send(chat_id, "Чат уже подключён. Панель в General {}.".format(
+                        "закреплена" if pinned else "отправлена, но не закреплена"))
             elif command == "/report":
                 with connect(self.db_path) as db:
                     if not db.execute("SELECT 1 FROM report_chats WHERE chat_id=?", (chat_id,)).fetchone():
                         self.api.send(chat_id, "Сначала отправьте /connect в этом чате.")
                         return
-                    posted = publish_project_reports(db, self.api, chat_id)
-                self.api.send(chat_id, "Отчёты по магазинам отправлены: {}.".format(posted["reports"]))
+                started = self.start_sync(chat_id)
+                self.api.send(chat_id, "Обновление VK поставлено в очередь. Готовые отчёты появятся в темах."
+                              if started else "Подключённых сообществ пока нет.")
             return
         if chat.get("type") != "private":
             return
-        buttons = {"📊 Отчёт": "/report", "🔄 Обновить": "/sync", "🏪 Проекты": "/groups",
-                   "➕ Проект": "/newproject", "➕ Группа": "/newgroup", "📄 Таблица": "/sheet",
+        user_id = (message.get("from") or {}).get("id") or chat_id
+        command_token = text.partition(" ")[0].split("@", 1)[0].lower()
+        if command_token.startswith("/start") and command_token != "/start":
+            try:
+                self.api.delete(chat_id, int(message["message_id"]))
+            except (KeyError, TelegramError):
+                pass
+            with connect(self.db_path) as db:
+                result = self._authorize(db, user_id, command_token[len("/start"):])
+            if result == "ok":
+                self.api.send(chat_id, "Доступ открыт. Используйте кнопки ниже.", keyboard=True)
+            elif result == "blocked":
+                self.api.send(chat_id, "Слишком много попыток. Повторите через час.")
+            else:
+                self.api.send(chat_id, "Неверная команда доступа.")
+            return
+        with connect(self.db_path) as db:
+            if not self._authorized(db, user_id):
+                self.api.send(chat_id, "Для доступа введите полученную от команды команду в личном чате бота.")
+                return
+        buttons = {"📊 Отчёт": "/report", "🔄 Обновить": "/report",
+                   "🔄 Собрать данные": "/report", "🏪 Проекты": "/groups",
+                   "➕ Подключить VK": "/newgroup", "➕ Проект": "/newgroup",
+                   "➕ Группа": "/newgroup", "📄 Таблица": "/sheet",
                    "ℹ️ Помощь": "/help"}
         text = buttons.get(text, text)
         if self.pending.get(chat_id) and not text.startswith("/"):
@@ -280,20 +476,28 @@ class ReportBot:
                     self.api.delete(chat_id, int(message["message_id"]))
                 except (KeyError, TelegramError):
                     self.api.send(chat_id, "Не удалось удалить сообщение с токеном. Удалите его вручную из чата.")
-                parts = [part.strip() for part in text.split("|", 2)]
-                if len(parts) != 3 or not parts[0] or not parts[1].isdigit() or not parts[2]:
-                    self.api.send(chat_id, "Формат: название проекта | ID группы | токен. Нажмите «➕ Группа» и повторите.")
+                token = text.strip()
+                try:
+                    group_id, name = group_from_token(token)
+                    VKClient(token, group_id).call("messages.getConversations", count=1, offset=0)
+                except VKError as exc:
+                    self.api.send(chat_id, "Не удалось подключить сообщество: {}. Проверьте ключ с доступом к сообщениям и повторите «➕ Подключить VK».".format(exc))
                     return
-                project, group_id, token = parts
                 with connect(self.db_path) as db:
-                    if not db.execute("SELECT 1 FROM projects WHERE name=?", (project,)).fetchone():
-                        self.api.send(chat_id, "Сначала добавьте проект «{}» кнопкой «➕ Проект».".format(project))
-                        return
+                    existing = db.execute("SELECT project FROM groups WHERE group_id=?", (group_id,)).fetchone()
+                    project = existing["project"] if existing else name[:120]
+                    if not existing and db.execute(
+                            "SELECT 1 FROM groups WHERE project=? LIMIT 1", (project,)).fetchone():
+                        suffix = " · VK {}".format(group_id)
+                        project = project[:120 - len(suffix)] + suffix
+                    db.execute("INSERT OR IGNORE INTO projects(name) VALUES (?)", (project,))
                     db.execute("INSERT INTO groups(group_id, project, token) VALUES (?, ?, ?) "
                                "ON CONFLICT(group_id) DO UPDATE SET project=excluded.project, token=excluded.token, enabled=1",
-                               (int(group_id), project, token))
+                               (group_id, project, token))
                     db.commit()
-                self.api.send(chat_id, "Группа {} подключена к проекту «{}». Запустите «🔄 Обновить».".format(group_id, project), keyboard=True)
+                self.start_sync(None, group_ids={group_id}, priority=2)
+                self.api.send(chat_id, "Подключено: «{}» (VK ID {}). Сбор за 30 дней поставлен в очередь автоматически.".format(
+                    project, group_id), keyboard=True)
                 return
         if not text.startswith("/"):
             return
@@ -304,12 +508,12 @@ class ReportBot:
                 with connect(self.db_path) as db:
                     db.execute("INSERT OR IGNORE INTO subscribers(chat_id, subscribed_at) VALUES (?, ?)", (chat_id, int(time.time())))
                     db.commit()
-            self.api.send(chat_id, "Кнопки: отчёт, обновление, проекты, добавление проекта и группы, таблица.\nКоманды: /report, /today, /group ID, /groups, /city, /sheet, /sync, /status.\nВ чате с темами отправьте /connect: бот создаст темы городов. При добавлении группы сообщение с токеном будет удалено.", keyboard=True)
+            self.api.send(chat_id, "Нажмите «📊 Отчёт»: бот соберёт свежие данные, покажет их здесь и отправит отчёты в темы магазинов. Ежедневные отчёты в темах приходят после 10:00 МСК. Для подключения сообщества нажмите «➕ Подключить VK» и отправьте его ключ доступа; сообщение с ключом бот удалит.", keyboard=True)
         elif command == "/stop":
             with connect(self.db_path) as db:
                 db.execute("DELETE FROM subscribers WHERE chat_id=?", (chat_id,))
                 db.commit()
-            self.api.send(chat_id, "Ежедневные сообщения отключены. Команды бота остаются доступны. Для подписки отправьте /start.")
+            self.api.send(chat_id, "Уведомления об ошибках отключены. Отчёт по кнопке остаётся доступен; /start снова включит уведомления.")
         elif command == "/newproject":
             self.pending[chat_id] = "project"
             self.api.send(chat_id, "Напишите: название проекта ; город. Пример: Магазин А ; Калуга")
@@ -325,18 +529,17 @@ class ReportBot:
             self.api.send(chat_id, "Город проекта обновлён." if changed else "Проект не найден. Проверьте название через /groups.")
         elif command == "/newgroup":
             self.pending[chat_id] = "group"
-            self.api.send(chat_id, "Отправьте одним сообщением: название проекта | числовой ID группы VK | токен группы.\nПример: Магазин А | 123456789 | токен\nСообщение с токеном бот удалит после получения.")
-        elif command == "/report":
+            self.api.send(chat_id, "Отправьте одним сообщением ключ доступа сообщества VK. Название и ID бот определит сам. Сообщение с ключом будет удалено после получения.")
+        elif command in ("/report", "/sync"):
+            self.api.send(chat_id, "Обновление VK поставлено в очередь. Ниже последняя доступная сводка; новые данные появятся в темах."
+                          if self.start_sync(chat_id) else "Подключённых сообществ пока нет.")
             with connect(self.db_path) as db:
-                self.api.send(chat_id, summary(db, 30))
-                detail, _ = report_data(db, 30)
-                if detail:
-                    self.api.send_document(chat_id, "vk-quality-30-days.csv", csv_text(detail),
-                                           "Полная статистика по каждому проекту и ID рекламы")
+                menu, markup = self._report_menu(db)
+            self.api.send(chat_id, menu, parse_mode="HTML", reply_markup=markup)
         elif command == "/today":
             with connect(self.db_path) as db:
                 self.api.send(chat_id, summary(db, 1))
-                detail, _ = report_data(db, 1)
+                detail, _ = report_data(db, 1, complete_only=True)
                 if detail:
                     self.api.send_document(chat_id, "vk-quality-today.csv", csv_text(detail),
                                            "Полная статистика за сегодня")
@@ -353,37 +556,98 @@ class ReportBot:
                 projects = [row["name"] for row in db.execute("SELECT name FROM projects ORDER BY name")]
                 groups = list(db.execute("SELECT project, group_id, enabled FROM groups ORDER BY project, group_id"))
             lines = ["{}: {}".format(name, ", ".join(str(g["group_id"]) + (" (отключено)" if not g["enabled"] else "") for g in groups if g["project"] == name) or "группы пока нет") for name in projects]
-            self._send_long(chat_id, "\n".join(lines) if lines else "Проектов пока нет. Нажмите «➕ Проект».")
+            self._send_long(chat_id, "\n".join(lines) if lines else "Проектов пока нет. Нажмите «➕ Подключить VK».")
         elif command == "/sheet":
             spreadsheet_id = os.environ.get("GOOGLE_SPREADSHEET_ID")
             self.api.send(chat_id, "https://docs.google.com/spreadsheets/d/" + spreadsheet_id if spreadsheet_id else "Google-таблица ещё не подключена.")
         elif command == "/status":
-            self.api.send(chat_id, self.status)
-        elif command == "/sync":
-            self.api.send(chat_id, "Запускаю сбор." if self.start_sync(chat_id) else "Сбор уже выполняется.")
+            with connect(self.db_path) as db:
+                total = db.execute("SELECT COUNT(*) FROM groups WHERE enabled=1").fetchone()[0]
+                ready = db.execute("SELECT COUNT(*) FROM groups g JOIN group_sync_state s ON s.group_id=g.group_id "
+                                   "WHERE g.enabled=1 AND s.completed_at IS NOT NULL").fetchone()[0]
+                queued = db.execute("SELECT COUNT(*) FROM sync_jobs").fetchone()[0]
+                running = db.execute("SELECT COUNT(*) FROM group_sync_state WHERE running=1").fetchone()[0]
+                failed = db.execute("SELECT COUNT(*) FROM group_sync_state WHERE last_error IS NOT NULL").fetchone()[0]
+            self.api.send(chat_id, "Сообществ: {} · готово: {} · в очереди: {} · обрабатывается: {} · ошибок: {}.\n{}".format(
+                total, ready, queued, running, failed, self.status))
 
     def _schedule(self) -> None:
         with connect(self.db_path) as db:
             config = get_settings(db)
             now = datetime.now(ZoneInfo(config["timezone"]))
             day = now.strftime("%Y-%m-%d")
-            if now.hour < 3 or _get_setting(db, "last_daily_run") == day:
-                return
             if not db.execute("SELECT 1 FROM groups WHERE enabled=1 LIMIT 1").fetchone():
                 return
-            if not self.sync_lock.acquire(blocking=False):
-                return
-            _set_setting(db, "last_daily_run", day)
-            self.status = "Ежедневный сбор выполняется."
-            threading.Thread(target=self._run_sync, args=(None,), daemon=True).start()
+            if now.hour >= 3 and _get_setting(db, "last_daily_run") != day:
+                queued = enqueue_groups(db)
+                _set_setting(db, "last_daily_run", day)
+                self.status = "Ежедневное обновление поставлено в очередь: {} сообществ.".format(queued)
+
+    def _publish_pending_once(self) -> bool:
+        with connect(self.db_path) as db:
+            now = datetime.now(ZoneInfo(get_settings(db)["timezone"]))
+            day = now.strftime("%Y-%m-%d")
+            row = db.execute(
+                "SELECT g.group_id,g.project,s.completed_at FROM groups g "
+                "JOIN group_sync_state s ON s.group_id=g.group_id "
+                "LEFT JOIN report_delivery_state d ON d.group_id=g.group_id "
+                "LEFT JOIN sync_jobs j ON j.group_id=g.group_id "
+                "WHERE g.enabled=1 AND s.completed_at IS NOT NULL AND j.group_id IS NULL "
+                "AND (s.completed_at>COALESCE(d.published_at,0) "
+                "OR (? AND COALESCE(d.report_day,'')!=?)) "
+                "ORDER BY s.completed_at,g.group_id LIMIT 1",
+                (int(now.hour >= 10), day)).fetchone()
+            if row:
+                publish_project_reports(db, self.api, project_names={row["project"]})
+                db.execute("INSERT INTO report_delivery_state(group_id,published_at,report_day) "
+                           "VALUES (?,?,?) ON CONFLICT(group_id) DO UPDATE SET "
+                           "published_at=excluded.published_at,report_day=excluded.report_day",
+                           (row["group_id"], row["completed_at"], day if now.hour >= 10 else None))
+                db.commit()
+                return True
+            last_sheet = int(_get_setting(db, "last_sheet_published", 0))
+            last_sheet_marker = int(_get_setting(db, "last_sheet_completed_at", 0))
+            latest = db.execute("SELECT COALESCE(MAX(completed_at),0) FROM group_sync_state").fetchone()[0]
+            if (latest > last_sheet_marker and int(time.time()) - last_sheet >= 900 and
+                    os.environ.get("GOOGLE_SPREADSHEET_ID") and
+                    os.path.isfile(os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", ""))):
+                publish_google(db)
+                _set_setting(db, "last_sheet_completed_at", latest)
+                _set_setting(db, "last_sheet_published", int(time.time()))
+        return False
+
+    def _publisher_loop(self) -> None:
+        while True:
+            try:
+                published = self._publish_pending_once()
+                time.sleep(1 if published else 5)
+            except Exception as exc:
+                self.status = "Ошибка публикации отчётов: " + str(exc)
+                time.sleep(10)
 
     def run(self) -> None:
         with connect(self.db_path) as db:
             offset = int(_get_setting(db, "telegram_offset", 0))
+            missing = [row["group_id"] for row in db.execute(
+                "SELECT g.group_id FROM groups g "
+                "LEFT JOIN group_sync_state s ON s.group_id=g.group_id "
+                "LEFT JOIN sync_jobs j ON j.group_id=g.group_id "
+                "WHERE g.enabled=1 AND j.group_id IS NULL "
+                "AND (s.completed_at IS NULL OR s.last_error IS NOT NULL)")]
+            now = datetime.now(ZoneInfo(get_settings(db)["timezone"]))
+            day = now.strftime("%Y-%m-%d")
+            daily_due = now.hour >= 3 and _get_setting(db, "last_daily_run") != day
+            if daily_due:
+                enqueue_groups(db)
+                _set_setting(db, "last_daily_run", day)
+        if missing and not daily_due:
+            self.start_sync(None, group_ids=missing)
+        threading.Thread(target=self._publisher_loop, daemon=True).start()
         while True:
             self._schedule()
             try:
-                updates = self.api.call("getUpdates", offset=offset, timeout=30, allowed_updates=["message"])
+                updates = self.api.call("getUpdates", offset=offset, timeout=30,
+                                        allowed_updates=["message", "callback_query"])
                 for update in updates:
                     try:
                         self.handle(update)

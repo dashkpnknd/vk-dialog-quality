@@ -5,6 +5,7 @@ import os
 import time
 
 from quality.db import connect
+from quality.jobs import run_worker
 from quality.report import csv_text, publish_google, report_data
 from quality.sync import sync_all
 from quality.telegram_bot import ReportBot
@@ -16,6 +17,7 @@ def main() -> None:
     parser.add_argument("--db", default=os.environ.get("DATABASE_PATH", "data/quality.sqlite3"))
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("bot")
+    commands.add_parser("worker")
     add = commands.add_parser("add-group")
     add.add_argument("project", help="Название магазина")
     add.add_argument("group_id", type=int, help="Числовой ID сообщества")
@@ -32,6 +34,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "bot":
         ReportBot(args.db).run()
+        return
+    if args.command == "worker":
+        run_worker(args.db)
         return
     with connect(args.db) as db:
         if args.command == "add-group":

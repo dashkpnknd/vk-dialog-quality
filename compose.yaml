@@ -6,3 +6,11 @@ services:
       - ./data:/data
       - ./secrets:/run/secrets:ro
     restart: unless-stopped
+  worker:
+    build: .
+    command: python main.py worker
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - ./secrets:/run/secrets:ro
+    restart: unless-stopped
